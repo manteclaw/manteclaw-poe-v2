@@ -1,32 +1,31 @@
-# Fly.io config for the Manteclaw Poe server bot v2.
-# Region iad is the cheapest; shared-cpu-1x 256MB always-on is $2.19/mo,
-# under Fly.io's under-$5 bill waiver.
-# One machine only (the old bot ran two for no reason). Health check on
-# /health -- the old app had none configured.
-app = "manteclaw-poe-v2"
-primary_region = "iad"
+# fly.toml app configuration file generated for mantecclaw-poe-v2 on 2026-11-21T14:53:44-05:00
+#
+# See https://docs.fly.io/reference/configuration for information about how to use this file.
+#
+
+app = 'mantecclaw-poe-v2'
+primary_region = 'iad'
 
 [build]
-  dockerfile = "Dockerfile"
+  dockerfile = 'Dockerfile'
 
 [env]
-  SURPLUS_MODEL = "deepseek/deepseek-v4.1-flash-1017"
+  SURPLUS_MODEL = 'deepseek/deepseek-v4.1-flash-1017'
 
 [http_service]
   internal_port = 8080
   force_https = true
-  auto_stop_machines = false
+  auto_stop_machines = 'off'
   auto_start_machines = true
   min_machines_running = 1
-  processes = ["app"]
+  processes = ['app']
 
   [[http_service.checks]]
-    name = "health"
-    path = "/health"
-    interval = "30s"
-    timeout = "5s"
-    grace_period = "10s"
+    interval = '30s'
+    timeout = '5s'
+    grace_period = '10s'
+    path = '/health'
 
 [[vm]]
-  size = "shared-cpu-1x"
-  memory = "256mb"
+  size = 'shared-cpu-1x'
+  memory = '256mb'
