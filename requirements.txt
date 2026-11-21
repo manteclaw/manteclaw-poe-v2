@@ -1,0 +1,6 @@
+# Pinned to the versions verified working locally on 2026-11-20.
+fastapi==0.165.0
+fastapi-poe==0.0.83
+uvicorn==0.54.0
+httpx==0.28.1
+sse-starlette==3.7.0
