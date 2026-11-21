@@ -1,7 +1,7 @@
 # Manteclaw Poe Bot v2
 
 A Poe server bot (FastAPI + fastapi-poe) that answers Poe queries with
-Mistral. Replaces the broken `manteclaw-poe-bot`, whose provider keys died
+SurplusLLM. Replaces the broken `manteclaw-poe-bot`, whose provider keys died
 and whose source is stuck on Alex's PC.
 
 - **Live:** https://manteclaw-poe-v2.fly.dev (once deployed)
@@ -23,9 +23,9 @@ questions. Speaks the Poe server-bot protocol:
 
 | Var | Required | What |
 |---|---|---|
-| `MISTRAL_API_KEY` | yes, for real answers | Mistral API key. Set as a Fly secret: `flyctl secrets set MISTRAL_API_KEY=...`. Without it the bot starts fine but answers queries with a clear "not set up yet" message. |
-| `MISTRAL_MODEL` | no (default `mistral-small-latest`) | Mistral model ID. Set in `fly.toml` or as a Fly secret. |
-| `MISTRAL_API_BASE_URL` | no (default `https://api.mistral.ai`) | Override for the Mistral API base URL (testing / Mistral-compatible endpoints). |
+| `SURPLUS_API_KEY` | yes, for real answers | SurplusLLM API key. Set as a Fly secret: `flyctl secrets set SURPLUS_API_KEY=...`. Without it the bot starts fine but answers queries with a clear "not set up yet" message. |
+| `SURPLUS_MODEL` | no (default `deepseek/deepseek-v4.1-flash-1017`) | SurplusLLM model ID. Set in `fly.toml` or as a Fly secret. |
+| `SURPLUS_API_BASE_URL` | no (default `https://api.surplusllm.com`) | Override for the SurplusLLM API base URL (testing / OpenAI-compatible endpoints). |
 | `POE_ACCESS_KEY` | no at first | Poe issues a 32-char key when the bot is created/updated at poe.com/create_bot?server=1. Set as a Fly secret once Poe issues it; until then requests are accepted without key auth. |
 | `PORT` | no (default 8080) | Set by Fly. |
 
@@ -38,7 +38,7 @@ broke without anyone noticing).
 ```bash
 python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
-MISTRAL_API_KEY=... .venv/bin/python server.py
+SURPLUS_API_KEY=... .venv/bin/python server.py
 # or: PORT=18090 .venv/bin/uvicorn server:app --host 0.0.0.0 --port 18090
 curl http://localhost:8080/health
 ```
@@ -53,7 +53,7 @@ org). The Dockerfile lists every file the image ships explicitly.
 ## Poe setup
 
 1. Deploy, then confirm `GET /health` returns 200.
-2. Set `MISTRAL_API_KEY` as a Fly secret, then test a real query.
+2. Set `SURPLUS_API_KEY` as a Fly secret, then test a real query.
 3. On Poe, update the bot's server URL to
    `https://manteclaw-poe-v2.fly.dev` (Poe setup only needs a server URL).
 4. Poe issues an access key — set it as the `POE_ACCESS_KEY` Fly secret.

@@ -1,14 +1,15 @@
 """Manteclaw Poe server bot (v2).
 
-A FastAPI + fastapi-poe server bot that answers Poe queries with Mistral.
+A FastAPI + fastapi-poe server bot that answers Poe queries with SurplusLLM.
 Replaces the broken mantecclaw-poe-bot, whose provider keys died and whose
 source is stuck on Alex's PC.
 
 - Poe protocol: POST / and POST /stream (SSE), settings with the intro
   message, /help handler. GET /health for Fly health checks.
-- Inference: Mistral API (mistral-small-latest by default).
-  Key ONLY from the MISTRAL_API_KEY env var (set as a Fly secret).
-  Model from MISTRAL_MODEL env var.
+- Inference: SurplusLLM (OpenAI-compatible gateway, api.surplusllm.com).
+  Model deepseek/deepseek-v4.1-flash-1017 by default (very cheap).
+  Key ONLY from the SURPLUS_API_KEY env var (set as a Fly secret).
+  Model from SURPLUS_MODEL env var.
 - Poe access key: from POE_ACCESS_KEY env var (set as a Fly secret once
   Poe issues one for the new server URL). If unset, requests are accepted
   without key auth so the server still works for setup/smoke tests.
@@ -65,28 +66,41 @@ SYSTEM_PROMPT = (
     "prices and balances may be out of date."
 )
 
-MISTRAL_API_BASE_URL = os.environ.get(
-    "MISTRAL_API_BASE_URL", "https://api.mistral.ai"
+SURPLUS_API_BASE_URL = os.environ.get(
+    "SURPLUS_API_BASE_URL", "https://api.surplusllm.com"
+)
+
+# SurplusLLM is OpenAI-compatible; its chat completions live at /api/v1.
+def _surplus_url() -> str:
+    return f"{SURPLUS_API_BASE_URL.rstrip('/')}/api/v1/chat/completions"
+
+
+# DeepSeek V4.1 Flash: very cheap (prompt ~$0.00000004/token,
+# completion ~$0.00000055/token), so a $10 credit balance covers
+# tens of thousands of Poe queries.
+DEFAULT_MODEL = "deepseek/deepseek-v4.1-flash-1017"
+
+
+def _surplus_model() -> str:
+    return os.environ.get("SURPLUS_MODEL", DEFAULT_MODEL)
+
+
+def _surplus_key() -> str:
+    return os.environ.get("SURPLUS_API_KEY", "")
+
+
+# SurplusLLM sits behind Cloudflare, which blocks the default Python
+# user agent with a 403 (error 1010), so every request carries a
+# browser user agent.
+BROWSER_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/120.0.0.0 Safari/537.36"
 )
 
 
-def _mistral_url() -> str:
-    return f"{MISTRAL_API_BASE_URL.rstrip('/')}/v1/chat/completions"
-
-
-DEFAULT_MODEL = "mistral-small-latest"
-
-
-def _mistral_model() -> str:
-    return os.environ.get("MISTRAL_MODEL", DEFAULT_MODEL)
-
-
-def _mistral_key() -> str:
-    return os.environ.get("MISTRAL_API_KEY", "")
-
-
-def _mistral_client() -> httpx.AsyncClient:
-    """httpx client for Mistral. Passes an explicit proxy (if the env sets
+def _surplus_client() -> httpx.AsyncClient:
+    """httpx client for SurplusLLM. Passes an explicit proxy (if the env sets
     one) and disables trust_env so httpx never parses NO_PROXY -- some
     environments put bare IPv6 addresses in NO_PROXY that httpx cannot
     parse, crashing client construction with InvalidURL. On Fly.io no
@@ -96,7 +110,7 @@ def _mistral_client() -> httpx.AsyncClient:
 
 
 def _build_messages(query) -> list:
-    """Map Poe ProtocolMessages to Mistral chat messages, prepending the
+    """Map Poe ProtocolMessages to SurplusLLM chat messages, prepending the
     system prompt if the conversation has no system message."""
     role_map = {"user": "user", "bot": "assistant", "system": "system"}
     messages = []
@@ -125,9 +139,9 @@ class ManteclawBot(fp.PoeBot):
             yield fp.PartialResponse(text=HELP_TEXT)
             return
 
-        api_key = _mistral_key()
+        api_key = _surplus_key()
         if not api_key:
-            log.error("MISTRAL_API_KEY is not set; cannot answer query")
+            log.error("SURPLUS_API_KEY is not set; cannot answer query")
             yield fp.PartialResponse(
                 text=(
                     "I'm not set up yet — my AI provider key hasn't been "
@@ -139,7 +153,7 @@ class ManteclawBot(fp.PoeBot):
 
         messages = _build_messages(request.query)
         payload = {
-            "model": _mistral_model(),
+            "model": _surplus_model(),
             "messages": messages,
             "stream": True,
             "temperature": 0.7,
@@ -147,16 +161,17 @@ class ManteclawBot(fp.PoeBot):
         headers = {
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
+            "User-Agent": BROWSER_USER_AGENT,
         }
         try:
-            async with _mistral_client() as client:
+            async with _surplus_client() as client:
                 async with client.stream(
-                    "POST", _mistral_url(), json=payload, headers=headers
+                    "POST", _surplus_url(), json=payload, headers=headers
                 ) as resp:
                     if resp.status_code != 200:
                         body = (await resp.aread()).decode("utf-8", "replace")[:500]
                         log.error(
-                            "Mistral API error: HTTP %s: %s",
+                            "SurplusLLM API error: HTTP %s: %s",
                             resp.status_code,
                             body,
                         )
@@ -166,6 +181,14 @@ class ManteclawBot(fp.PoeBot):
                                     "My AI provider rejected the API key — it "
                                     "may be expired or invalid. The server "
                                     "owner needs to update it."
+                                )
+                            )
+                        elif resp.status_code == 402:
+                            yield fp.PartialResponse(
+                                text=(
+                                    "I'm out of AI credits right now — my "
+                                    "provider balance is empty. The server "
+                                    "owner needs to top it up."
                                 )
                             )
                         elif resp.status_code == 429:
@@ -203,7 +226,7 @@ class ManteclawBot(fp.PoeBot):
                             got_any = True
                             yield fp.PartialResponse(text=delta)
                     if not got_any:
-                        log.warning("Mistral stream returned no content")
+                        log.warning("SurplusLLM stream returned no content")
                         yield fp.PartialResponse(
                             text=(
                                 "I got an empty response from my AI provider. "
@@ -214,7 +237,7 @@ class ManteclawBot(fp.PoeBot):
             # Broad catch on purpose: httpx.InvalidURL (a plain Exception,
             # not an HTTPError) and any other provider failure must surface
             # as a clean user-facing message, never an SSE error event.
-            log.exception("Mistral request failed: %s", exc)
+            log.exception("SurplusLLM request failed: %s", exc)
             yield fp.PartialResponse(
                 text=(
                     "I couldn't reach my AI provider just now. "
