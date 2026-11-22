@@ -10,6 +10,11 @@ source is stuck on Alex's PC.
   Model deepseek/deepseek-v4.1-flash-1017 by default (very cheap).
   Key ONLY from the SURPLUS_API_KEY env var (set as a Fly secret).
   Model from SURPLUS_MODEL env var.
+- Fallback: if SurplusLLM fails before producing any content (HTTP error,
+  timeout, empty stream), the same prompt is retried once via OpenRouter
+  (same model by default), key from the OPENROUTER_API_KEY env var
+  (Fly secret), model from FALLBACK_MODEL. SurplusLLM stays primary;
+  the fallback only covers SurplusLLM outages.
 - Poe access key: from POE_ACCESS_KEY env var (set as a Fly secret once
   Poe issues one for the new server URL). If unset, requests are accepted
   without key auth so the server still works for setup/smoke tests.
@@ -38,7 +43,7 @@ logging.basicConfig(
 )
 log = logging.getLogger("manteclaw-poe-v2")
 
-VERSION = "1.0.0"  # single source of truth (fixes the old bot's 2.3.0/2.2.0 split)
+VERSION = "1.1.0"  # single source of truth (fixes the old bot's 2.3.0/2.2.0 split)
 
 INTRO_MESSAGE = (
     "Hi! I'm Manteclaw, your AI assistant. I can help with coding, writing, "
@@ -132,6 +137,148 @@ def _last_user_text(query) -> str:
     return ""
 
 
+# --- Fallback provider (OpenRouter) --------------------------------------
+# SurplusLLM stays primary. When it fails before producing any content,
+# the same prompt is retried once here so a SurplusLLM outage (e.g. the
+# all-day HTTP 503s of 2026-11-21) no longer kills the bot.
+
+OPENROUTER_API_BASE_URL = os.environ.get(
+    "OPENROUTER_API_BASE_URL", "https://openrouter.ai"
+)
+
+
+def _fallback_url() -> str:
+    return f"{OPENROUTER_API_BASE_URL.rstrip('/')}/api/v1/chat/completions"
+
+
+def _fallback_key() -> str:
+    return os.environ.get("OPENROUTER_API_KEY", "")
+
+
+def _fallback_model() -> str:
+    # Default to the primary's model so fallback answers behave the same.
+    return os.environ.get("FALLBACK_MODEL", _surplus_model())
+
+
+class _ProviderFailure(Exception):
+    """A provider attempt failed. `kind` is "http", "empty" or "exception";
+    `status` carries the HTTP status code for kind == "http"."""
+
+    def __init__(self, kind, status=None):
+        super().__init__(kind)
+        self.kind = kind
+        self.status = status
+
+
+async def _stream_completion(url, api_key, model, messages, provider):
+    """Stream one chat completion from an OpenAI-compatible provider,
+    yielding content deltas. Raises _ProviderFailure if the provider
+    errors or the stream breaks; if that happens after some deltas were
+    already yielded, the caller treats the answer as partial."""
+    payload = {
+        "model": model,
+        "messages": messages,
+        "stream": True,
+        "temperature": 0.7,
+    }
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+        "User-Agent": BROWSER_USER_AGENT,
+    }
+    try:
+        async with _surplus_client() as client:
+            async with client.stream(
+                "POST", url, json=payload, headers=headers
+            ) as resp:
+                if resp.status_code != 200:
+                    body = (await resp.aread()).decode("utf-8", "replace")[:500]
+                    log.error(
+                        "%s API error: HTTP %s: %s",
+                        provider,
+                        resp.status_code,
+                        body,
+                    )
+                    raise _ProviderFailure("http", status=resp.status_code)
+                got_any = False
+                async for line in resp.aiter_lines():
+                    if not line.startswith("data:"):
+                        continue
+                    data = line[5:].strip()
+                    if not data or data == "[DONE]":
+                        continue
+                    try:
+                        chunk = json.loads(data)
+                    except json.JSONDecodeError:
+                        continue
+                    choices = chunk.get("choices") or []
+                    if not choices:
+                        continue
+                    delta = (choices[0].get("delta") or {}).get("content") or ""
+                    if delta:
+                        got_any = True
+                        yield delta
+                if not got_any:
+                    log.warning("%s stream returned no content", provider)
+                    raise _ProviderFailure("empty")
+    except _ProviderFailure:
+        raise
+    except Exception as exc:
+        # Broad catch on purpose: httpx.InvalidURL (a plain Exception,
+        # not an HTTPError) and any other provider failure must surface
+        # as a _ProviderFailure, never as an SSE error event.
+        log.exception("%s request failed: %s", provider, exc)
+        raise _ProviderFailure("exception")
+
+
+async def _attempt(url, api_key, model, messages, provider):
+    """One provider attempt as an event stream: yields ("delta", text)
+    for each content chunk and, if the attempt failed, a final
+    ("failure", _ProviderFailure). A failure after deltas means the
+    answer was cut off mid-stream."""
+    try:
+        async for delta in _stream_completion(
+            url, api_key, model, messages, provider
+        ):
+            yield ("delta", delta)
+    except _ProviderFailure as failure:
+        yield ("failure", failure)
+
+
+def _failure_message(failure) -> str:
+    """User-facing message when every provider attempt failed before
+    producing content. Wording matches the pre-fallback bot, keyed off
+    the primary (SurplusLLM) failure."""
+    if failure is not None and failure.kind == "http":
+        if failure.status == 401:
+            return (
+                "My AI provider rejected the API key — it may be expired "
+                "or invalid. The server owner needs to update it."
+            )
+        if failure.status == 402:
+            return (
+                "I'm out of AI credits right now — my provider balance "
+                "is empty. The server owner needs to top it up."
+            )
+        if failure.status == 429:
+            return (
+                "My AI provider is rate-limiting requests right now — "
+                "please try again in a moment."
+            )
+        return (
+            "I ran into an error reaching my AI provider "
+            f"(HTTP {failure.status}). Please try again later."
+        )
+    if failure is not None and failure.kind == "empty":
+        return (
+            "I got an empty response from my AI provider. Please try again."
+        )
+    return (
+        "I couldn't reach my AI provider just now. "
+        "Please try again in a moment."
+    )
+
+
 class ManteclawBot(fp.PoeBot):
     async def get_response(self, request: fp.QueryRequest):
         # /help is answered locally, no provider call needed.
@@ -139,12 +286,13 @@ class ManteclawBot(fp.PoeBot):
             yield fp.PartialResponse(text=HELP_TEXT)
             return
 
-        api_key = _surplus_key()
-        if not api_key:
-            log.error("SURPLUS_API_KEY is not set; cannot answer query")
+        surplus_key = _surplus_key()
+        fallback_key = _fallback_key()
+        if not surplus_key and not fallback_key:
+            log.error("No provider API key is set; cannot answer query")
             yield fp.PartialResponse(
                 text=(
-                    "I'm not set up yet — my AI provider key hasn't been "
+                    "I'm not set up yet \u2014 my AI provider key hasn't been "
                     "configured on the server. The server owner needs to add "
                     "it, then I'll be able to answer. Please try again later."
                 )
@@ -152,98 +300,60 @@ class ManteclawBot(fp.PoeBot):
             return
 
         messages = _build_messages(request.query)
-        payload = {
-            "model": _surplus_model(),
-            "messages": messages,
-            "stream": True,
-            "temperature": 0.7,
-        }
-        headers = {
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-            "User-Agent": BROWSER_USER_AGENT,
-        }
-        try:
-            async with _surplus_client() as client:
-                async with client.stream(
-                    "POST", _surplus_url(), json=payload, headers=headers
-                ) as resp:
-                    if resp.status_code != 200:
-                        body = (await resp.aread()).decode("utf-8", "replace")[:500]
-                        log.error(
-                            "SurplusLLM API error: HTTP %s: %s",
-                            resp.status_code,
-                            body,
-                        )
-                        if resp.status_code == 401:
-                            yield fp.PartialResponse(
-                                text=(
-                                    "My AI provider rejected the API key — it "
-                                    "may be expired or invalid. The server "
-                                    "owner needs to update it."
-                                )
-                            )
-                        elif resp.status_code == 402:
-                            yield fp.PartialResponse(
-                                text=(
-                                    "I'm out of AI credits right now — my "
-                                    "provider balance is empty. The server "
-                                    "owner needs to top it up."
-                                )
-                            )
-                        elif resp.status_code == 429:
-                            yield fp.PartialResponse(
-                                text=(
-                                    "My AI provider is rate-limiting requests "
-                                    "right now — please try again in a moment."
-                                )
-                            )
-                        else:
-                            yield fp.PartialResponse(
-                                text=(
-                                    "I ran into an error reaching my AI "
-                                    f"provider (HTTP {resp.status_code}). "
-                                    "Please try again later."
-                                )
-                            )
-                        return
-                    got_any = False
-                    async for line in resp.aiter_lines():
-                        if not line.startswith("data:"):
-                            continue
-                        data = line[5:].strip()
-                        if not data or data == "[DONE]":
-                            continue
-                        try:
-                            chunk = json.loads(data)
-                        except json.JSONDecodeError:
-                            continue
-                        choices = chunk.get("choices") or []
-                        if not choices:
-                            continue
-                        delta = (choices[0].get("delta") or {}).get("content") or ""
-                        if delta:
-                            got_any = True
-                            yield fp.PartialResponse(text=delta)
-                    if not got_any:
-                        log.warning("SurplusLLM stream returned no content")
-                        yield fp.PartialResponse(
-                            text=(
-                                "I got an empty response from my AI provider. "
-                                "Please try again."
-                            )
-                        )
-        except Exception as exc:
-            # Broad catch on purpose: httpx.InvalidURL (a plain Exception,
-            # not an HTTPError) and any other provider failure must surface
-            # as a clean user-facing message, never an SSE error event.
-            log.exception("SurplusLLM request failed: %s", exc)
-            yield fp.PartialResponse(
-                text=(
-                    "I couldn't reach my AI provider just now. "
-                    "Please try again in a moment."
+
+        # Primary first (SurplusLLM), then the fallback (OpenRouter) once,
+        # with the same prompt, if the primary fails before answering.
+        attempts = []
+        if surplus_key:
+            attempts.append(
+                ("SurplusLLM", _surplus_url(), surplus_key, _surplus_model())
+            )
+        if fallback_key:
+            attempts.append(
+                (
+                    "OpenRouter (fallback)",
+                    _fallback_url(),
+                    fallback_key,
+                    _fallback_model(),
                 )
             )
+
+        primary_failure = None
+        for idx, (provider, url, api_key, model) in enumerate(attempts):
+            served_any = False
+            failure = None
+            async for kind, data in _attempt(
+                url, api_key, model, messages, provider
+            ):
+                if kind == "delta":
+                    served_any = True
+                    yield fp.PartialResponse(text=data)
+                else:
+                    failure = data
+            if served_any:
+                log.info("Request served by %s", provider)
+                if failure is not None:
+                    # Partial answer, then the stream broke mid-response.
+                    yield fp.PartialResponse(
+                        text=(
+                            "\n\n(The response was cut off by a provider "
+                            "error \u2014 please ask again if it looks "
+                            "incomplete.)"
+                        )
+                    )
+                return
+            if idx == 0:
+                primary_failure = failure
+            log.warning(
+                "%s failed before answering (%s, HTTP %s); %s",
+                provider,
+                failure.kind if failure else "unknown",
+                failure.status if failure else "-",
+                "falling back" if idx + 1 < len(attempts) else "no fallback left",
+            )
+
+        # Every attempt failed before producing any content.
+        yield fp.PartialResponse(text=_failure_message(primary_failure))
 
     async def get_settings(self, setting: fp.SettingsRequest):
         return fp.SettingsResponse(
